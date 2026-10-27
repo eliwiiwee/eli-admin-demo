@@ -127,7 +127,10 @@ $('#forgot').onclick = async e => {   // the reset link opens the account page (
     $('#loginErr').textContent = ''; toast(`ส่งลิงก์ตั้งรหัสผ่านใหม่ไปที่ ${email} แล้ว`);
   });
 };
-const refreshBadge = async () => { try { const s = await rpc('admin_orders', { p_status: 'new', p_limit: 1 }); const n = s.counts?.new || 0; $('#navNew').textContent = n; $('#navNew').hidden = !n; } catch (e) {} };
+const refreshBadge = async () => {
+  try { const s = await rpc('admin_orders', { p_status: 'new', p_limit: 1 }); const n = s.counts?.new || 0; $('#navNew').textContent = n; $('#navNew').hidden = !n; } catch (e) {}
+  try { const n = (await rpc('admin_reports', { p_status: 'open', p_limit: 1 })).open || 0; $('#navRep').textContent = n; $('#navRep').hidden = !n; } catch (e) {}
+};
 
 /* ── router ── */
 const PAGES = {};

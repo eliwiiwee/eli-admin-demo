@@ -1111,6 +1111,165 @@ grant execute on all functions in schema public to authenticated;
 revoke execute on all functions in schema private from public, anon, authenticated;
 grant execute on function private.is_admin(), private.is_owner(), private.can_health(), private.mfa_ok(), private.cfg(text, numeric) to authenticated;
 
+-- ── 20261027000001_report_block.sql ──
+-- Eli's World — report and block people in Hero Hall (Google Play's user-generated content rules: other people's names and
+-- profile photos show in Hero Hall, so members can report one and block someone; the team reviews reports in the back office).
+
+create table public.blocks (
+  user_id uuid not null references public.profiles on delete cascade,
+  blocked_id uuid not null references public.profiles on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, blocked_id),
+  check (user_id <> blocked_id)
+);
+
+create table public.reports (
+  id bigint generated always as identity primary key,
+  reporter_id uuid references public.profiles on delete set null,   -- kept when the reporter deletes their account
+  target_id uuid not null references public.profiles on delete cascade,
+  reason text not null check (reason in ('name', 'photo', 'other')),
+  note text not null default '' check (char_length(note) <= 300),
+  status text not null default 'open' check (status in ('open', 'done', 'dismissed')),
+  action text,                       -- what the team did: dismiss / clear_photo / reset_name / suspend
+  handled_by uuid references auth.users on delete set null,
+  handled_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create unique index reports_one_open on public.reports (reporter_id, target_id) where status = 'open';   -- one open report per person each
+create index reports_open on public.reports (created_at desc) where status = 'open';
+
+alter table public.blocks enable row level security;
+alter table public.reports enable row level security;
+revoke all on public.blocks, public.reports from anon, authenticated;   -- only through the functions below
+
+-- either one blocked the other
+create or replace function private.blocked(a uuid, b uuid) returns boolean language sql stable security definer set search_path = ''
+as $$ select exists (select 1 from public.blocks where (user_id = a and blocked_id = b) or (user_id = b and blocked_id = a)) $$;
+
+/* ───────────── what the app calls ───────────── */
+
+create or replace function public.report_user(p_target uuid, p_reason text, p_note text default '') returns void language plpgsql security definer set search_path = ''
+as $$ declare uid uuid := auth.uid(); begin
+  perform private.member(uid);
+  if p_target = uid or not exists (select 1 from public.profiles where id = p_target) then raise exception 'bad target'; end if;
+  if p_reason not in ('name', 'photo', 'other') then raise exception 'bad reason'; end if;
+  if (select count(*) from public.reports where reporter_id = uid and created_at > now() - interval '1 day') >= 20 then raise exception 'too_many_reports'; end if;
+  insert into public.reports (reporter_id, target_id, reason, note) values (uid, p_target, p_reason, left(trim(coalesce(p_note, '')), 300))
+  on conflict (reporter_id, target_id) where status = 'open' do update set reason = excluded.reason, note = excluded.note, created_at = now();
+end $$;
+
+-- block: they leave my Hero Hall and I leave theirs, the friendship ends, no hearts either way
+create or replace function public.block_user(p_target uuid) returns void language plpgsql security definer set search_path = ''
+as $$ declare uid uuid := auth.uid(); begin
+  perform private.member(uid);
+  if p_target = uid or not exists (select 1 from public.profiles where id = p_target) then raise exception 'bad target'; end if;
+  insert into public.blocks (user_id, blocked_id) values (uid, p_target) on conflict do nothing;
+  delete from public.friends where (user_id = uid and friend_id = p_target) or (user_id = p_target and friend_id = uid);
+end $$;
+create or replace function public.unblock_user(p_target uuid) returns void language plpgsql security definer set search_path = ''
+as $$ begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  delete from public.blocks where user_id = auth.uid() and blocked_id = p_target;
+end $$;
+create or replace function public.my_blocks() returns jsonb language sql stable security definer set search_path = ''
+as $$ select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'name', p.name, 'avatar', p.avatar) order by b.created_at desc), '[]')
+      from public.blocks b join public.profiles p on p.id = b.blocked_id where b.user_id = auth.uid() $$;
+
+-- Hero Hall without the people I blocked (or who blocked me)
+create or replace function public.hall() returns jsonb language sql stable security definer set search_path = ''
+as $$ with ids as (
+    select auth.uid() as id
+    union select friend_id from public.friends where user_id = auth.uid()
+    union (select id from public.profiles p where not hall_hidden and suspended_at is null and not private.blocked(auth.uid(), p.id) order by total_lp desc limit 20)
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', p.id, 'name', p.name, 'avatar', p.avatar, 'total', p.total_lp, 'streak', p.streak,
+      'week', private.week_lp(p.id), 'me', p.id = auth.uid(),
+      'friend', exists (select 1 from public.friends f where f.user_id = auth.uid() and f.friend_id = p.id),
+      'away', not exists (select 1 from public.days d where d.user_id = p.id and d.day >= private.today() - 3),
+      'sent', exists (select 1 from public.hearts h where h.from_id = auth.uid() and h.to_id = p.id and h.day = private.today()))), '[]')
+  from public.profiles p join ids on ids.id = p.id
+  where p.id = auth.uid() or (not p.hall_hidden and p.suspended_at is null and not private.blocked(auth.uid(), p.id)) $$;
+
+create or replace function public.send_heart(p_to uuid) returns jsonb language plpgsql security definer set search_path = ''
+as $$ declare uid uuid := auth.uid(); begin
+  perform private.member(uid);
+  if p_to = uid or not exists (select 1 from public.profiles where id = p_to) or private.blocked(uid, p_to) then raise exception 'bad target'; end if;
+  insert into public.hearts (from_id, to_id, day) values (uid, p_to, private.today()) on conflict do nothing;
+  insert into public.days (user_id, day) values (uid, private.today()) on conflict do nothing;
+  update public.days set sent = true where user_id = uid and day = private.today();
+  return private.state(uid);
+end $$;
+
+create or replace function public.add_friend(p_code text) returns jsonb language plpgsql security definer set search_path = ''
+as $$ declare uid uuid := auth.uid(); f uuid; nm text; begin
+  perform private.member(uid);
+  select id, name into f, nm from public.profiles where invite_code = upper(trim(coalesce(p_code, '')));
+  if f is null or f = uid or private.blocked(uid, f) then raise exception 'no_such_code'; end if;
+  insert into public.friends (user_id, friend_id) values (uid, f), (f, uid) on conflict do nothing;
+  return jsonb_build_object('id', f, 'name', nm);
+end $$;
+
+-- the PDPA copy also lists who I blocked
+create or replace function private.export_user(uid uuid) returns jsonb language plpgsql stable security definer set search_path = ''
+as $$ begin
+  return jsonb_build_object(
+    'exported_at', now(),
+    'account', (select jsonb_build_object('email', email, 'created_at', created_at, 'last_sign_in_at', last_sign_in_at) from auth.users where id = uid),
+    'profile', (select to_jsonb(p) - 'settled_to' - 'shield_streak' from public.profiles p where id = uid),
+    'days', (select coalesce(jsonb_agg(to_jsonb(d) - 'user_id' order by d.day), '[]') from public.days d where user_id = uid),
+    'runs', (select coalesce(jsonb_agg(to_jsonb(r) - 'user_id' order by r.created_at), '[]') from public.runs r where user_id = uid),
+    'redemptions', (select coalesce(jsonb_agg(to_jsonb(o) - 'user_id' - 'admin_note' order by o.created_at), '[]') from public.redemptions o where user_id = uid),
+    'coins', (select coalesce(jsonb_agg(to_jsonb(c) - 'user_id' - 'note' order by c.at), '[]') from public.coin_log c where user_id = uid),
+    'friends', (select coalesce(jsonb_agg(p.name), '[]') from public.friends f join public.profiles p on p.id = f.friend_id where f.user_id = uid),
+    'blocked', (select coalesce(jsonb_agg(p.name), '[]') from public.blocks b join public.profiles p on p.id = b.blocked_id where b.user_id = uid));
+end $$;
+
+/* ───────────── back office ───────────── */
+
+-- reports, newest first; open ones by default. Who reported stays with the team only.
+create or replace function public.admin_reports(p_status text default 'open', p_limit int default 50, p_offset int default 0)
+returns jsonb language plpgsql stable security definer set search_path = ''
+as $$ declare res jsonb; total int; begin
+  perform private.need_admin();
+  select coalesce(jsonb_agg(j), '[]'), coalesce(max(n), 0) into res, total from (
+    select jsonb_build_object('id', r.id, 'reason', r.reason, 'note', r.note, 'status', r.status, 'action', r.action, 'created_at', r.created_at, 'handled_at', r.handled_at,
+             'handled_by', (select email from auth.users where id = r.handled_by),
+             'target', jsonb_build_object('id', t.id, 'name', t.name, 'avatar', t.avatar, 'citizen_id', lpad(t.citizen_no::text, 6, '0'), 'suspended_at', t.suspended_at,
+                         'open_reports', (select count(*) from public.reports x where x.target_id = t.id and x.status = 'open')),
+             'reporter', case when rp.id is null then null else jsonb_build_object('id', rp.id, 'name', rp.name, 'citizen_id', lpad(rp.citizen_no::text, 6, '0')) end) j,
+           count(*) over () n
+    from public.reports r join public.profiles t on t.id = r.target_id left join public.profiles rp on rp.id = r.reporter_id
+    where coalesce(p_status, '') = '' or r.status = p_status
+    order by r.created_at desc
+    limit least(p_limit, 200) offset greatest(p_offset, 0)) x;
+  return jsonb_build_object('rows', res, 'total', total, 'open', (select count(*) from public.reports where status = 'open'));
+end $$;
+
+-- act on a report: dismiss it, or remove the photo / reset the name (staff), or suspend (owners). Every open report on the
+-- same person closes with it, and the step goes to the back-office log.
+create or replace function public.admin_resolve_report(p_id bigint, p_action text, p_reason text default '') returns void language plpgsql security definer set search_path = ''
+as $$ declare r public.reports; begin
+  perform private.need_admin();
+  select * into r from public.reports where id = p_id;
+  if not found then raise exception 'no_report'; end if;
+  if p_action = 'clear_photo' then update public.profiles set avatar = null where id = r.target_id;
+  elsif p_action = 'reset_name' then update public.profiles set name = 'พลเมือง #' || lpad(citizen_no::text, 6, '0') where id = r.target_id;
+  elsif p_action = 'suspend' then perform public.admin_suspend(r.target_id, coalesce(nullif(trim(p_reason), ''), 'ถูกรายงานใน Hero Hall'));
+  elsif p_action <> 'dismiss' then raise exception 'bad_action'; end if;
+  if p_action = 'dismiss' then
+    update public.reports set status = 'dismissed', action = p_action, handled_by = auth.uid(), handled_at = now() where id = p_id;
+  else
+    update public.reports set status = 'done', action = p_action, handled_by = auth.uid(), handled_at = now() where target_id = r.target_id and (status = 'open' or id = p_id);
+  end if;
+  perform private.audit('report.' || p_action, r.target_id::text, jsonb_build_object('report', p_id, 'reason', r.reason));
+end $$;
+
+revoke execute on all functions in schema public from public, anon;
+grant execute on all functions in schema public to authenticated;
+revoke execute on all functions in schema private from public, anon, authenticated;
+grant execute on function private.is_admin(), private.is_owner(), private.can_health(), private.mfa_ok(), private.cfg(text, numeric) to authenticated;
+
 -- ── seed.sql ──
 -- Treasury items shown in the approved UI. Edit, add or hide them in the Supabase dashboard (Table editor → products).
 insert into public.products (id, tab, name, coins, img, is_new, sort) values
@@ -1180,5 +1339,9 @@ insert into public.campaigns (name, coin_mult, starts_at, ends_at) values ('ฉ�
 insert into public.announcements (title, body, starts_at, ends_at) values ('ยินดีต้อนรับสู่ Eli''s World 💙', 'ช่วงเปิดตัว เดิน นอน และวิ่ง ได้เหรียญ ×2 ถึงสิ้นเดือนนี้ แลกของได้ที่ Treasury', now() - interval '1 day', now() + interval '7 days');
 update public.days set steps = 71000 where user_id = (select id from auth.users where email = 'member07@eli.test') and day = private.today() - 1;
 insert into public.runs (user_id, started_at, sec, meters, lp, coin) select id, now() - interval '2 days', 1200, 12000, 0, 0 from auth.users where email = 'member07@eli.test';
+-- two reports from Hero Hall waiting for the team
+insert into public.reports (reporter_id, target_id, reason, note, created_at)
+select r.id, t.id, x.reason, x.note, now() - x.ago from (values ('member03', 'member12', 'name', 'ชื่อมีคำหยาบ', interval '3 hours'), ('member05', 'member12', 'name', '', interval '1 hour'), ('member09', 'member17', 'photo', 'รูปไม่เหมาะกับคนทั่วไป', interval '20 minutes')) x(rep, tgt, reason, note, ago)
+join auth.users r on r.email = x.rep || '@eli.test' join auth.users t on t.email = x.tgt || '@eli.test';
 select (select count(*) from public.profiles) members, (select count(*) from public.days) days, (select count(*) from public.runs) runs, (select count(*) from public.redemptions) orders;
 commit;

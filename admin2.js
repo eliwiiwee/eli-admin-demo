@@ -180,11 +180,44 @@ PAGES.rules = {
   },
 };
 
+/* ═══════ รายงานผู้ใช้ (from Hero Hall: a name or photo that isn't OK) ═══════ */
+const RQ = { status: 'open', offset: 0 };
+const WHY = { photo: 'รูปโปรไฟล์ไม่เหมาะสม', name: 'ชื่อไม่เหมาะสม', other: 'อื่น ๆ' };
+const DID = { dismiss: 'ปิด (ไม่ผิด)', clear_photo: 'ลบรูปโปรไฟล์', reset_name: 'รีเซ็ตชื่อ', suspend: 'ระงับบัญชี' };
+PAGES.reports = {
+  title: 'รายงานผู้ใช้',
+  async render(pg) {
+    const r = await rpc('admin_reports', { p_status: RQ.status, p_limit: PAGE, p_offset: RQ.offset });
+    pg.innerHTML = `<div class="bar"><div class="seg" id="seg">${[['open', `รอตรวจ${r.open ? ` (${fmt(r.open)})` : ''}`], ['done', 'จัดการแล้ว'], ['dismissed', 'ไม่ผิด'], ['', 'ทั้งหมด']].map(([k, n]) => `<button data-s="${k}" class="${RQ.status === k ? 'on' : ''}">${n}</button>`).join('')}</div>
+      <span class="mut" style="font-size:13.5px">สมาชิกรายงานชื่อหรือรูปใน Hero Hall · ควรตรวจภายใน 24 ชม. · คนที่ถูกรายงานไม่เห็นว่าใครรายงาน</span></div>
+      ${r.rows.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>ผู้ถูกรายงาน</th><th>เหตุผล</th><th>ผู้รายงาน</th><th>เมื่อ</th><th>${RQ.status === 'open' ? '' : 'ผล'}</th></tr></thead><tbody>
+        ${r.rows.map(x => `<tr data-r="${x.id}" style="cursor:default"><td><div class="who" data-id="${esc(x.target.id)}" style="cursor:pointer"><img class="av" src="${esc(avatar(x.target.avatar))}" alt=""><div><b>${esc(x.target.name)}</b><small>ID ${esc(x.target.citizen_id)}${x.target.open_reports > 1 ? ` · <span class="neg">รอตรวจ ${x.target.open_reports} รายงาน</span>` : ''}${x.target.suspended_at ? ' · <span class="neg">ระงับอยู่</span>' : ''}</small></div></div></td>
+          <td class="wrap" style="min-width:150px"><b>${esc(WHY[x.reason] || x.reason)}</b>${x.note ? `<br><span class="mut">${esc(x.note)}</span>` : ''}</td>
+          <td>${x.reporter ? `${esc(x.reporter.name)} <small class="mut">ID ${esc(x.reporter.citizen_id)}</small>` : '<span class="mut">ลบบัญชีแล้ว</span>'}</td><td class="mut">${dtTH(x.created_at)}</td>
+          <td>${x.status === 'open' ? `<div class="row" style="flex-wrap:wrap;gap:6px">${x.target.avatar ? '<button class="btn sm" data-a="clear_photo">ลบรูป</button>' : ''}<button class="btn sm" data-a="reset_name">รีเซ็ตชื่อ</button>
+              ${ME.role === 'owner' && !x.target.suspended_at ? '<button class="btn danger sm" data-a="suspend">ระงับบัญชี</button>' : ''}<button class="btn ghost sm" data-a="dismiss">ไม่ผิด</button></div>`
+            : `${esc(DID[x.action] || x.action || '')}<br><small class="mut">${x.handled_by ? esc(x.handled_by) + ' · ' : ''}${x.handled_at ? dtTH(x.handled_at) : ''}</small>`}</td></tr>`).join('')}
+        </tbody></table></div>${pager(r.total, RQ)}` : `<div class="card empty">${RQ.status === 'open' ? 'ไม่มีรายงานที่รอตรวจ' : 'ยังไม่มีรายงาน'}</div>`}`;
+    $$('#seg button', pg).forEach(b => b.onclick = () => { RQ.status = b.dataset.s; RQ.offset = 0; route(); });
+    $$('.who[data-id]', pg).forEach(w => w.onclick = () => openMember(w.dataset.id));
+    $$('[data-a]', pg).forEach(b => b.onclick = async () => {
+      const x = r.rows.find(y => String(y.id) === b.closest('tr').dataset.r), a = b.dataset.a, nm = esc(x.target.name);
+      let reason = '';
+      if (a === 'suspend') { const v = await askForm('ระงับบัญชี?', `${nm} จะถูกออกจากระบบทุกเครื่อง เข้าใหม่ไม่ได้ และหายจาก Hero Hall จนกว่าจะยกเลิก`, [{ name: 'why', label: 'เหตุผล (บันทึกไว้)', value: `ถูกรายงาน: ${WHY[x.reason]}` }], 'ระงับบัญชี', true); if (!v) return; reason = v.why; }
+      else if (!(await confirmBox({ clear_photo: 'ลบรูปโปรไฟล์?', reset_name: 'รีเซ็ตชื่อ?', dismiss: 'ปิดรายงานนี้?' }[a],
+        { clear_photo: `รูปของ ${nm} จะกลับเป็นรูปเริ่มต้น`, reset_name: `ชื่อของ ${nm} จะเปลี่ยนเป็น "พลเมือง #${esc(x.target.citizen_id)}" (เจ้าตัวตั้งชื่อใหม่ได้)`, dismiss: 'ไม่พบสิ่งที่ผิด ปิดรายงานนี้โดยไม่เปลี่ยนอะไร' }[a], 'ยืนยัน', a !== 'dismiss'))) return;
+      try { await rpc('admin_resolve_report', { p_id: x.id, p_action: a, p_reason: reason }); toast(a === 'dismiss' ? 'ปิดรายงานแล้ว' : `${DID[a]}แล้ว · ปิดรายงานของคนนี้ทั้งหมด`); refreshBadge(); route(); } catch (e) { oops(e); }
+    });
+    bindPager(pg, RQ);
+  },
+};
+
 /* ═══════ บันทึกการกระทำ ═══════ */
 const ACT = { order: 'คำสั่งแลก', 'orders.bulk_read': 'เปิดคำสั่งแลกจำนวนมาก', 'coupons.export': 'ดูโค้ดที่แจกแล้ว', 'team.approve_mfa': 'อนุมัติยืนยัน 2 ขั้น', 'products.insert': 'เพิ่มของรางวัล', 'products.update': 'แก้ของรางวัล', 'products.delete': 'ลบของรางวัล', 'coupons.add': 'เพิ่มโค้ดคูปอง', 'coupons.clear': 'ลบโค้ดที่ยังไม่แจก',
   adjust_coins: 'ปรับเหรียญ', suspend: 'ระงับบัญชี', unsuspend: 'ยกเลิกระงับ', set_streak: 'ตั้ง Streak', delete_member: 'ลบบัญชีสมาชิก', export_member: 'ส่งออกข้อมูลสมาชิก', view_health: 'ดูข้อมูลสุขภาพ',
   setting: 'แก้กติกา', 'campaigns.insert': 'สร้างอีเวนต์', 'campaigns.update': 'แก้อีเวนต์', 'campaigns.delete': 'ลบอีเวนต์', 'announcements.insert': 'สร้างประกาศ', 'announcements.update': 'แก้ประกาศ', 'announcements.delete': 'ลบประกาศ',
-  team: 'จัดการทีม', export_orders: 'ดาวน์โหลดคำสั่งแลก', print_labels: 'พิมพ์ใบปะหน้า', export_coupons: 'ดาวน์โหลดโค้ดคูปอง' };
+  team: 'จัดการทีม', export_orders: 'ดาวน์โหลดคำสั่งแลก', print_labels: 'พิมพ์ใบปะหน้า', export_coupons: 'ดาวน์โหลดโค้ดคูปอง',
+  'report.dismiss': 'ปิดรายงาน (ไม่ผิด)', 'report.clear_photo': 'ลบรูปโปรไฟล์ (รายงาน)', 'report.reset_name': 'รีเซ็ตชื่อ (รายงาน)', 'report.suspend': 'ระงับบัญชี (รายงาน)' };
 const AQ = { action: '', offset: 0 };
 const detail = l => { const d = l.detail || {};
   if (l.action === 'order') return `${STATUS[d.from]?.[0] || d.from} → ${STATUS[d.to]?.[0] || d.to}${d.tracking ? ` · พัสดุ ${d.tracking}` : ''}`;

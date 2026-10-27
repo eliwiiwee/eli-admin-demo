@@ -3,7 +3,7 @@
    on Postgres compiled to WebAssembly (PGlite) with the sample data, kept in this browser's storage only.
    Sign-in, 2-step codes and the parts of Supabase the admin uses are imitated here; nothing leaves the browser. */
 (() => {
-  const BUILD = '202610251357';                       // build.mjs: a new bundle starts a fresh demo database
+  const BUILD = '202610270733';                       // build.mjs: a new bundle starts a fresh demo database
   const STORE = 'eli-admin-demo', SKEY = 'eli_admin_demo_auth';
   const USERS = { 'admin@eli.test': 'eliadmin123', 'staff@eli.test': 'elistaff123' };   // members: eliworld123
   const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
